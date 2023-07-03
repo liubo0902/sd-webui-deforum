@@ -5,7 +5,7 @@ import itertools
 import requests
 import numexpr
 from modules import processing, sd_models
-from modules.shared import sd_model, state, cmd_opts
+from modules.shared import sd_model, state, cmd_opts, opts, api_aux_keys
 from .deforum_controlnet import is_controlnet_enabled, process_with_controlnet
 from .prompt import split_weighted_subprompts
 from .load_images import load_img, prepare_mask, check_mask_for_errors
@@ -13,7 +13,12 @@ from .webui_sd_pipeline import get_webui_sd_pipeline
 from .rich import console
 from .defaults import get_samplers_list
 from .prompt import check_is_number
-from .general_utils import debug_print
+from PIL import Image
+from gradio.processing_utils import encode_pil_to_base64
+from enum import Enum
+import requests
+from io import BytesIO
+import base64
 
 def load_mask_latent(mask_input, shape):
     # mask_input (str or PIL Image.Image): Path to the mask image or a PIL Image object
@@ -48,14 +53,14 @@ def pairwise_repl(iterable):
     next(b, None)
     return zip(a, b)
 
-def generate(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter,  frame=0, sampler_name=None):
+def generate(args, keys, anim_args, loop_args, controlnet_args, root, frame=0, sampler_name=None):
     if state.interrupted:
         return None
 
     if args.reroll_blank_frames == 'ignore':
-        return generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame, sampler_name)
+        return generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, frame, sampler_name)
 
-    image, caught_vae_exception = generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame, sampler_name)
+    image, caught_vae_exception = generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, frame, sampler_name)
 
     if caught_vae_exception or not image.getbbox():
         patience = args.reroll_patience
@@ -64,7 +69,7 @@ def generate(args, keys, anim_args, loop_args, controlnet_args, root, parseq_ada
             while caught_vae_exception or not image.getbbox():
                 print("Rerolling with +1 seed...")
                 args.seed += 1
-                image, caught_vae_exception = generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame, sampler_name)
+                image, caught_vae_exception = generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, frame, sampler_name)
                 patience -= 1
                 if patience == 0:
                     print("Rerolling with +1 seed failed for 10 iterations! Try setting webui's precision to 'full' and if it fails, please report this to the devs! Interrupting...")
@@ -78,12 +83,12 @@ def generate(args, keys, anim_args, loop_args, controlnet_args, root, parseq_ada
             return None
     return image
 
-def generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame=0, sampler_name=None):
+def generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, root, frame=0, sampler_name=None):
     if cmd_opts.disable_nan_check:
-        image = generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame, sampler_name)
+        image = generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, frame, sampler_name)
     else:
         try:
-            image = generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame, sampler_name)
+            image = generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, frame, sampler_name)
         except Exception as e:
             if "A tensor with all NaNs was produced in VAE." in repr(e):
                 print(e)
@@ -92,7 +97,7 @@ def generate_with_nans_check(args, keys, anim_args, loop_args, controlnet_args, 
                 raise e
     return image, False
 
-def generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, parseq_adapter, frame=0, sampler_name=None):
+def generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, frame=0, sampler_name=None):
     # Setup the pipeline
     p = get_webui_sd_pipeline(args, root)
     p.prompt, p.negative_prompt = split_weighted_subprompts(args.prompt, frame, anim_args.max_frames)
@@ -105,8 +110,6 @@ def generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, pars
     image_init0 = None
 
     if loop_args.use_looper and anim_args.animation_mode in ['2D', '3D']:
-
-        debug_print(f"Looper: use_looper={loop_args.use_looper}, imageStrength={loop_args.imageStrength}, blendFactorMax={loop_args.blendFactorMax}, blendFactorSlope={loop_args.blendFactorSlope}, tweeningFrames={loop_args.tweeningFrameSchedule}, colorCorrectionFactor={loop_args.colorCorrectionFactor}")
         args.strength = loop_args.imageStrength
         tweeningFrames = loop_args.tweeningFrameSchedule
         blendFactor = .07
@@ -204,9 +207,76 @@ def generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, pars
 
         print_combined_table(args, anim_args, p_txt, keys, frame)  # print dynamic table to cli
 
-        if is_controlnet_enabled(controlnet_args):
-            process_with_controlnet(p_txt, args, anim_args, controlnet_args, root, parseq_adapter, is_img2img=False, frame_idx=frame)
+        if cmd_opts.just_ui:
+            import uuid
+            simple_txt2img = {
+                "firstphase_width": 0,
+                "firstphase_height": 0,
+                "prompt": p.prompt,
+                "styles": p.styles,
+                "seed": p.seed,
+                "subseed": p.subseed,
+                "subseed_strength": p.subseed_strength,
+                "seed_resize_from_h": p.seed_resize_from_h,
+                "seed_resize_from_w": p.seed_resize_from_w,
+                "batch_size": p.batch_size,
+                "n_iter": p.n_iter,
+                "steps": p.steps,
+                "cfg_scale": p.cfg_scale,
+                "width": p.width,
+                "height": p.height,
+                "restore_faces": p.restore_faces,
+                "enable_hr": False,
+                "denoising_strength": 0,
+                "tiling": p.tiling,
+                "negative_prompt": p.negative_prompt,
+                "sampler_index": p.sampler_name,
+                "alwayson_scripts":{
+                    "sd_model_checkpoint": p.sd_model.sd_checkpoint_info.model_name, 
+                    "id_task": str(uuid.uuid1()), 
+                    "uid": cmd_opts.uid, 
+                    "sd_vae": opts.sd_vae
+                },
+            }
+            override_settings = {}
+            setting_dict = opts.__dict__['data']
+            for key in api_aux_keys:
+                override_settings[key] = setting_dict.get(key)
+            simple_txt2img["alwayson_scripts"]["override_settings"] = override_settings
 
+        if is_controlnet_enabled(controlnet_args):
+            if cmd_opts.just_ui:
+                simple_txt2img['alwayson_scripts']['controlnet'] = {'args':[]}
+                cn_args = process_with_controlnet(p_txt, args, anim_args, controlnet_args, root, is_img2img=False, frame_idx=frame)
+                for cn_arg in cn_args:
+                    for cn_key, cn_val in cn_arg.items():
+                        if isinstance(cn_val, Enum):
+                            cn_val = cn_val.value
+                        elif (cn_key == 'image') and (isinstance(cn_val, dict)):
+                            if cn_val.get('image', None) is not None:
+                                cn_val['image'] = encode_pil_to_base64(Image.fromarray(cn_val['image']))
+                            if cn_val.get('mask', None) is not None:
+                                cn_val['mask'] = encode_pil_to_base64(Image.fromarray(cn_val['mask']))
+                        cn_arg[cn_key] = cn_val
+                    simple_txt2img['alwayson_scripts']['controlnet']['args'].append(cn_args)
+            else:
+                process_with_controlnet(p_txt, args, anim_args, controlnet_args, root, is_img2img=False, frame_idx=frame)
+        if cmd_opts.just_ui:
+            url_txt2img = '/'.join([cmd_opts.server_path, 'sdapi/v1/txt2img'])
+            data = requests.post(url_txt2img, json=simple_txt2img, headers={'x-eas-uid': cmd_opts.uid})
+            if data.status_code != 200:
+                processed = processing.Processed(p_txt,[],comments=data.text)
+            else:
+                data_text = json.loads(data.text)
+                imgs = data_text['images']
+                info = json.loads(data_text['info'])
+                if root.initial_info is None:
+                    root.initial_info = info['infotexts']
+                for img_i, img in enumerate(imgs):
+                    im = Image.open(BytesIO(base64.b64decode(img)))
+                    if root.first_frame is None:
+                        root.first_frame = im
+                    return im
         processed = processing.process_images(p_txt)
 
     if processed is None:
@@ -234,11 +304,87 @@ def generate_inner(args, keys, anim_args, loop_args, controlnet_args, root, pars
         p.init_images = [init_image]
         p.image_mask = mask
         p.image_cfg_scale = args.pix2pix_img_cfg_scale
+        if cmd_opts.just_ui:
+            import uuid
+            simple_img2img = {
+                "firstphase_width": 0,
+                "firstphase_height": 0,
+                "prompt": p.prompt,
+                "styles": p.styles,
+                "seed": p.seed,
+                "subseed": p.subseed,
+                "subseed_strength": p.subseed_strength,
+                "seed_resize_from_h": p.seed_resize_from_h,
+                "seed_resize_from_w": p.seed_resize_from_w,
+                "batch_size": p.batch_size,
+                "n_iter": p.n_iter,
+                "steps": p.steps,
+                "cfg_scale": p.cfg_scale,
+                "width": p.width,
+                "height": p.height,
+                "restore_faces": p.restore_faces,
+                "enable_hr": False,
+                "denoising_strength": 0,
+                "tiling": p.tiling,
+                "negative_prompt": p.negative_prompt,
+                "sampler_index": p.sampler_name,
+                "init_images": [encode_pil_to_base64(init_image)] if init_image is not None else None,
+                "mask": encode_pil_to_base64(mask) if mask is not None else None,
+                "inpainting_fill": p.inpainting_fill,
+                "inpaint_full_res": p.inpaint_full_res,
+                "inpaint_full_res_padding": p.inpaint_full_res_padding,
+                "inpainting_mask_invert": p.inpainting_mask_invert,
+                "denoising_strength": p.denoising_strength,
+                "image_cfg_scale": p.image_cfg_scale,
+                "alwayson_scripts":{
+                    "sd_model_checkpoint": p.sd_model.sd_checkpoint_info.model_name, 
+                    "id_task": str(uuid.uuid1()), 
+                    "uid": cmd_opts.uid, 
+                    "sd_vae": opts.sd_vae
+                },
+            }
+            override_settings = {}
+            setting_dict = opts.__dict__['data']
+            for key in api_aux_keys:
+                override_settings[key] = setting_dict.get(key)
+            simple_img2img["alwayson_scripts"]["override_settings"] = override_settings
+
 
         print_combined_table(args, anim_args, p, keys, frame)  # print dynamic table to cli
 
         if is_controlnet_enabled(controlnet_args):
-            process_with_controlnet(p, args, anim_args, controlnet_args, root, parseq_adapter, is_img2img=True, frame_idx=frame)
+            if cmd_opts.just_ui:
+                simple_img2img['alwayson_scripts']['controlnet'] = {'args':[]}
+                cn_args = process_with_controlnet(p_txt, args, anim_args, controlnet_args, root, is_img2img=False, frame_idx=frame)
+                for cn_arg in cn_args:
+                    for cn_key, cn_val in cn_arg.items():
+                        if isinstance(cn_val, Enum):
+                            cn_val = cn_val.value
+                        elif (cn_key == 'image') and (isinstance(cn_val, dict)):
+                            if cn_val.get('image', None) is not None:
+                                cn_val['image'] = encode_pil_to_base64(Image.fromarray(cn_val['image']))
+                            if cn_val.get('mask', None) is not None:
+                                cn_val['mask'] = encode_pil_to_base64(Image.fromarray(cn_val['mask']))
+                        cn_arg[cn_key] = cn_val
+                    simple_img2img['alwayson_scripts']['controlnet']['args'].append(cn_args)
+            else:
+                process_with_controlnet(p, args, anim_args, controlnet_args, root, is_img2img=True, frame_idx=frame)
+        if cmd_opts.just_ui:
+            url_img2img = '/'.join([cmd_opts.server_path, 'sdapi/v1/img2img'])
+            data = requests.post(url_img2img, json=simple_img2img, headers={'x-eas-uid': cmd_opts.uid})
+            if data.status_code != 200:
+                processed = processing.Processed(p,[],comments=data.text)
+            else:
+                data_text = json.loads(data.text)
+                imgs = data_text['images']
+                info = json.loads(data_text['info'])
+                if root.initial_info is None:
+                    root.initial_info = info['infotexts']
+                for img_i, img in enumerate(imgs):
+                    im = Image.open(BytesIO(base64.b64decode(img)))
+                    if root.first_frame is None:
+                        root.first_frame = im
+                    return im
 
         processed = processing.process_images(p)
 
